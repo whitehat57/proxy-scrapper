@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -74,12 +75,12 @@ func main() {
 	checker.validateProxies(allProxies)
 
 	// Simpan hasil ke file
-	err := saveProxiesToFile(checker.validProxies, "claude_valid_proxies.txt")
+	err := saveProxiesToFile(checker.validProxies, "valid_proxies.txt")
 	if err != nil {
 		log.Printf("❌ Error menyimpan proxy valid: %v", err)
 	}
 
-	err = saveProxiesToFile(checker.invalidProxies, "claude_invalid_proxies.txt")
+	err = saveProxiesToFile(checker.invalidProxies, "invalid_proxies.txt")
 	if err != nil {
 		log.Printf("❌ Error menyimpan proxy invalid: %v", err)
 	}
@@ -90,8 +91,8 @@ func main() {
 	fmt.Println("=====================================")
 	fmt.Printf("✅ Proxy Valid: %d\n", len(checker.validProxies))
 	fmt.Printf("❌ Proxy Invalid: %d\n", len(checker.invalidProxies))
-	fmt.Printf("📁 Proxy valid disimpan di: claude_valid_proxies.txt\n")
-	fmt.Printf("📁 Proxy invalid disimpan di: claude_invalid_proxies.txt\n")
+	fmt.Printf("📁 Proxy valid disimpan di: valid_proxies.txt\n")
+	fmt.Printf("📁 Proxy invalid disimpan di: invalid_proxies.txt\n")
 }
 
 func scrapeAllProxies() []Proxy {
@@ -100,7 +101,7 @@ func scrapeAllProxies() []Proxy {
 	var wg sync.WaitGroup
 
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 
 	for _, source := range proxySources {
@@ -288,8 +289,8 @@ func (pc *ProxyChecker) testProxyConnection(proxy Proxy, testURL string) bool {
 	proxyURL := fmt.Sprintf("http://%s", proxy.Full)
 	client := &http.Client{
 		Transport: &http.Transport{
-			Proxy: func(*http.Request) (*http.URL, error) {
-				return http.ParseURL(proxyURL)
+			Proxy: func(*http.Request) (*url.URL, error) {
+				return url.Parse(proxyURL)
 			},
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				d := net.Dialer{Timeout: 5 * time.Second}
