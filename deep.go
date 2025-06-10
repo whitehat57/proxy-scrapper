@@ -2,12 +2,10 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -18,22 +16,89 @@ import (
 const (
 	maxConcurrentChecks = 200
 	checkTimeout        = 10 * time.Second
-	targetCheckURL      = "http://example.com"
+	scrapeTimeout       = 30 * time.Second
 	goodProxiesFile     = "good_proxies.txt"
 )
 
-// Sumber proxy gratis
-var proxySources = []string{
-	"https://free-proxy-list.net/",
-	"https://www.sslproxies.org/",
-	"https://www.us-proxy.org/",
-	"https://www.proxyscan.io/",
+// Sumber proxy gratis dengan parser khusus
+var proxySources = []struct {
+	URL    string
+	Parser func(*goquery.Document) []string
+}{
+	{
+		URL: "https://free-proxy-list.net/",
+		Parser: func(doc *goquery.Document) []string {
+			var proxies []string
+			doc.Find("table#proxylisttable tbody tr").Each(func(i int, s *goquery.Selection) {
+				ip := s.Find("td:nth-child(1)").Text()
+				port := s.Find("td:nth-child(2)").Text()
+				if ip != "" && port != "" {
+					proxies = append(proxies, ip+":"+port)
+				}
+			})
+			return proxies
+		},
+	},
+	{
+		URL: "https://www.sslproxies.org/",
+		Parser: func(doc *goquery.Document) []string {
+			var proxies []string
+			doc.Find("table#proxylisttable tbody tr").Each(func(i int, s *goquery.Selection) {
+				ip := s.Find("td:nth-child(1)").Text()
+				port := s.Find("td:nth-child(2)").Text()
+				if ip != "" && port != "" {
+					proxies = append(proxies, ip+":"+port)
+				}
+			})
+			return proxies
+		},
+	},
+	{
+		URL: "https://www.us-proxy.org/",
+		Parser: func(doc *goquery.Document) []string {
+			var proxies []string
+			doc.Find("table#proxylisttable tbody tr").Each(func(i int, s *goquery.Selection) {
+				ip := s.Find("td:nth-child(1)").Text()
+				port := s.Find("td:nth-child(2)").Text()
+				if ip != "" && port != "" {
+					proxies = append(proxies, ip+":"+port)
+				}
+			})
+			return proxies
+		},
+	},
+	{
+		URL: "https://proxyscrape.com/free-proxy-list",
+		Parser: func(doc *goquery.Document) []string {
+			var proxies []string
+			doc.Find("table.table tbody tr").Each(func(i int, s *goquery.Selection) {
+				ip := s.Find("td:nth-child(1)").Text()
+				port := s.Find("td:nth-child(2)").Text()
+				if ip != "" && port != "" {
+					proxies = append(proxies, ip+":"+port)
+				}
+			})
+			return proxies
+		},
+	},
+	{
+		URL: "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc",
+		Parser: func(doc *goquery.Document) []string {
+			// Situs ini mengembalikan JSON, kita akan tangani secara khusus
+			return []string{}
+		},
+	},
 }
 
 func main() {
 	log.Println("Memulai proses scraping proxy...")
 	allProxies := scrapeAllProxies()
 	log.Printf("Berhasil mengumpulkan %d proxy\n", len(allProxies))
+
+	if len(allProxies) == 0 {
+		log.Println("Tidak ada proxy yang ditemukan, keluar...")
+		return
+	}
 
 	log.Println("Memulai pengecekan proxy...")
 	goodProxies := checkProxiesConcurrently(allProxies)
@@ -50,31 +115,38 @@ func scrapeAllProxies() []string {
 
 	for _, source := range proxySources {
 		wg.Add(1)
-		go func(s string) {
+		go func(s struct {
+			URL    string
+			Parser func(*goquery.Document) []string
+		}) {
 			defer wg.Done()
-			proxies, err := scrapeProxies(s)
+			proxies, err := scrapeProxies(s.URL, s.Parser)
 			if err != nil {
-				log.Printf("Gagal scrape %s: %v", s, err)
+				log.Printf("Gagal scrape %s: %v", s.URL, err)
 				return
 			}
 			
 			mu.Lock()
 			allProxies = append(allProxies, proxies...)
 			mu.Unlock()
-			log.Printf("Scrape %s: %d proxy", s, len(proxies))
+			log.Printf("Scrape %s: %d proxy", s.URL, len(proxies))
 		}(source)
 	}
 	wg.Wait()
 	return deduplicateProxies(allProxies)
 }
 
-func scrapeProxies(url string) ([]string, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+func scrapeProxies(url string, parser func(*goquery.Document) []string) ([]string, error) {
+	client := &http.Client{Timeout: scrapeTimeout}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	
+	// Set header untuk menyerupai browser
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.64 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -86,25 +158,41 @@ func scrapeProxies(url string) ([]string, error) {
 		return nil, fmt.Errorf("status code %d", resp.StatusCode)
 	}
 
-	return extractProxies(resp.Body)
-}
+	// Handle khusus untuk API JSON (GeoNode)
+	if strings.Contains(url, "geonode.com") {
+		return scrapeGeoNodeProxies(resp)
+	}
 
-func extractProxies(body io.Reader) ([]string, error) {
-	doc, err := goquery.NewDocumentFromReader(body)
+	// Parsing HTML untuk situs lainnya
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
+	return parser(doc), nil
+}
+
+func scrapeGeoNodeProxies(resp *http.Response) ([]string, error) {
+	type geoNodeProxy struct {
+		IP   string `json:"ip"`
+		Port string `json:"port"`
+	}
+
+	type geoNodeResponse struct {
+		Data []geoNodeProxy `json:"data"`
+	}
+
+	var result geoNodeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
 	var proxies []string
-	ipPortRegex := regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b`)
-
-	doc.Find("td").Each(func(i int, s *goquery.Selection) {
-		text := strings.TrimSpace(s.Text())
-		if ipPortRegex.MatchString(text) {
-			proxies = append(proxies, text)
+	for _, p := range result.Data {
+		if p.IP != "" && p.Port != "" {
+			proxies = append(proxies, p.IP+":"+p.Port)
 		}
-	})
-
+	}
 	return proxies, nil
 }
 
@@ -112,9 +200,6 @@ func deduplicateProxies(proxies []string) []string {
 	unique := make(map[string]bool)
 	var result []string
 	for _, proxy := range proxies {
-		if parts := strings.Split(proxy, ":"); len(parts) != 2 {
-			continue
-		}
 		if _, exists := unique[proxy]; !exists {
 			unique[proxy] = true
 			result = append(result, proxy)
@@ -128,13 +213,7 @@ func checkProxiesConcurrently(proxies []string) []string {
 	results := make(chan string)
 	var wg sync.WaitGroup
 	var goodProxies []string
-
-	// Hasil collector
-	go func() {
-		for proxy := range results {
-			goodProxies = append(goodProxies, proxy)
-		}
-	}()
+	var mu sync.Mutex
 
 	// Worker
 	for _, proxy := range proxies {
@@ -142,18 +221,21 @@ func checkProxiesConcurrently(proxies []string) []string {
 		go func(p string) {
 			defer wg.Done()
 			sem <- struct{}{}
-			if alive := checkProxy(p); alive {
-				results <- p
+			alive := checkProxy(p)
+			<-sem
+
+			if alive {
+				mu.Lock()
+				goodProxies = append(goodProxies, p)
+				mu.Unlock()
 				fmt.Printf("[✓] %s\n", p)
 			} else {
 				fmt.Printf("[✗] %s\n", p)
 			}
-			<-sem
 		}(proxy)
 	}
 
 	wg.Wait()
-	close(results)
 	return goodProxies
 }
 
@@ -164,15 +246,32 @@ func checkProxy(proxy string) bool {
 	}
 
 	client := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
-		Timeout:   checkTimeout,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			// Disable keep-alive untuk koneksi lebih cepat
+			DisableKeepAlives: true,
+		},
+		Timeout: checkTimeout,
 	}
 
-	// Double check dengan 2 request berbeda
-	check1 := checkWithClient(client, "http://example.com")
-	check2 := checkWithClient(client, "http://httpbin.org/ip")
-	
-	return check1 && check2
+	// Coba dengan beberapa target berbeda
+	targets := []string{
+		"http://example.com",
+		"http://httpbin.org/ip",
+		"http://google.com",
+	}
+
+	successCount := 0
+	for _, target := range targets {
+		if checkWithClient(client, target) {
+			successCount++
+		}
+		// Beri jeda singkat antara pengecekan
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Dianggap valid jika berhasil di 2 dari 3 target
+	return successCount >= 2
 }
 
 func checkWithClient(client *http.Client, url string) bool {
@@ -180,6 +279,11 @@ func checkWithClient(client *http.Client, url string) bool {
 	if err != nil {
 		return false
 	}
+
+	// Set timeout khusus untuk request
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -191,9 +295,14 @@ func checkWithClient(client *http.Client, url string) bool {
 }
 
 func saveProxiesToFile(proxies []string, filename string) {
+	if len(proxies) == 0 {
+		log.Println("Tidak ada proxy yang valid untuk disimpan")
+		return
+	}
+
 	content := strings.Join(proxies, "\n")
 	err := os.WriteFile(filename, []byte(content), 0644)
 	if err != nil {
-		log.Fatalf("Gagal menyimpan file: %v", err)
+		log.Printf("Gagal menyimpan file: %v", err)
 	}
 }
